@@ -265,6 +265,7 @@ targets:
 {info_block}
     settings:
       base:
+        PRODUCT_NAME: {app_name}
         PRODUCT_BUNDLE_IDENTIFIER: {bundle_id}
         MARKETING_VERSION: "1.0.0"
         CURRENT_PROJECT_VERSION: "1"
