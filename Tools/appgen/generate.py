@@ -296,7 +296,123 @@ purchases). To go live:
    distinct from any sibling app. Re-niche, never reskin.
 
 Bundle id: `{bundle_id}`
+
+## Ship to TestFlight
+
+This app ships with a Fastlane lane + GitHub Actions workflow. One-time account
+setup (API key, signing) is documented in the kit's `Tools/appgen/DEPLOYMENT.md`.
+Once your GitHub secrets are set, trigger the **TestFlight** workflow (or push a
+`v*` tag), or run locally:
+
+```bash
+bundle install
+bundle exec fastlane beta
+```
 '''
+
+
+# Deploy templates use __TOKENS__ (not f-strings) — Ruby/YAML are full of braces.
+FASTFILE_TMPL = '''default_platform(:ios)
+
+platform :ios do
+  desc "Build __APP__ and upload to TestFlight"
+  lane :beta do
+    setup_ci if ENV["CI"]
+
+    api_key = app_store_connect_api_key(
+      key_id: ENV.fetch("ASC_KEY_ID"),
+      issuer_id: ENV.fetch("ASC_ISSUER_ID"),
+      key_content: ENV.fetch("ASC_KEY_CONTENT"),
+      is_key_content_base64: true
+    )
+
+    # Materialize the Xcode project from project.yml (project is gitignored).
+    sh("cd .. && xcodegen generate")
+
+    # Pull the App Store distribution cert + provisioning profile from your
+    # private `match` repo. Set MATCH_GIT_URL + MATCH_PASSWORD to enable.
+    if ENV["MATCH_GIT_URL"]
+      match(
+        type: "appstore",
+        app_identifier: "__BUNDLE__",
+        git_url: ENV.fetch("MATCH_GIT_URL"),
+        readonly: true,
+        api_key: api_key
+      )
+    end
+
+    build_number = ENV["GITHUB_RUN_NUMBER"] || Time.now.strftime("%Y%m%d%H%M")
+
+    build_app(
+      project: "__APP__.xcodeproj",
+      scheme: "__APP__",
+      export_method: "app-store",
+      xcargs: "CURRENT_PROJECT_VERSION=#{build_number}",
+      output_directory: "build",
+      clean: true
+    )
+
+    upload_to_testflight(
+      api_key: api_key,
+      skip_waiting_for_build_processing: true
+    )
+  end
+end
+'''
+
+APPFILE_TMPL = '''app_identifier("__BUNDLE__")
+# Auth is via App Store Connect API key (see fastlane/Fastfile), so apple_id and
+# team_id are not required here.
+'''
+
+GEMFILE_TMPL = '''source "https://rubygems.org"
+
+gem "fastlane"
+'''
+
+WORKFLOW_TMPL = '''name: TestFlight
+
+# Manual trigger, or push a v* tag to ship a build.
+on:
+  workflow_dispatch:
+  push:
+    tags: ["v*"]
+
+jobs:
+  beta:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "3.3"
+          bundler-cache: true
+
+      - name: Build and upload to TestFlight
+        run: bundle exec fastlane beta
+        env:
+          ASC_KEY_ID: ${{ secrets.ASC_KEY_ID }}
+          ASC_ISSUER_ID: ${{ secrets.ASC_ISSUER_ID }}
+          ASC_KEY_CONTENT: ${{ secrets.ASC_KEY_CONTENT }}
+          MATCH_GIT_URL: ${{ secrets.MATCH_GIT_URL }}
+          MATCH_PASSWORD: ${{ secrets.MATCH_PASSWORD }}
+          MATCH_GIT_BASIC_AUTHORIZATION: ${{ secrets.MATCH_GIT_BASIC_AUTHORIZATION }}
+'''
+
+
+def render_deploy_files(app_name, bundle_id):
+    def fill(t):
+        return t.replace("__APP__", app_name).replace("__BUNDLE__", bundle_id)
+    return {
+        "Gemfile": GEMFILE_TMPL,
+        os.path.join("fastlane", "Fastfile"): fill(FASTFILE_TMPL),
+        os.path.join("fastlane", "Appfile"): fill(APPFILE_TMPL),
+        os.path.join(".github", "workflows", "testflight.yml"): WORKFLOW_TMPL,
+    }
 
 
 def main():
@@ -331,15 +447,23 @@ def main():
         os.path.join(src_dir, "App.swift"): render_app_swift(n, app_name, color, hero, hero2),
         os.path.join(src_dir, "ContentView.swift"): render_content_swift(n, app_name, color, hero),
         os.path.join(app_dir, "README.md"): render_readme(n, app_name, bundle_id),
-        os.path.join(app_dir, ".gitignore"): "*.xcodeproj/\n.build/\nDerivedData/\n.DS_Store\n",
+        os.path.join(app_dir, ".gitignore"):
+            "*.xcodeproj/\n.build/\nDerivedData/\nbuild/\n.DS_Store\nfastlane/report.xml\n",
     }
+    # The Xcode project is regenerated from project.yml by CI/Fastlane, so it's
+    # gitignored — ship the deploy pipeline instead.
+    for rel, content in render_deploy_files(app_name, bundle_id).items():
+        files[os.path.join(app_dir, rel)] = content
+
     for path, content in files.items():
+        os.makedirs(os.path.dirname(path), exist_ok=True)
         with open(path, "w") as f:
             f.write(content)
 
     print(f"✅ Generated {app_name}  ({n['tier']}-tier, score {n['score']})")
     print(f"   {app_dir}")
-    print(f"   Next: cd '{app_dir}' && xcodegen generate && open {app_name}.xcodeproj")
+    print(f"   Run locally:  cd '{app_dir}' && xcodegen generate && open {app_name}.xcodeproj")
+    print(f"   Ship:         set GitHub secrets (see Tools/appgen/DEPLOYMENT.md), run the TestFlight workflow")
 
 
 if __name__ == "__main__":
